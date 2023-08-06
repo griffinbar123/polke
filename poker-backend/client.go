@@ -1,12 +1,9 @@
 package main
 
 import (
-	"encoding/json"
 	"log"
-	"net/http"
 
 	"github.com/gorilla/websocket"
-	"github.com/stretchr/objx"
 )
 
 type Client struct {
@@ -14,167 +11,144 @@ type Client struct {
 	PlayerId string `json:"player-id"`
 	Balance  int    `json:"balance"`
 }
-type ClientWrapper struct {
+
+func (client *Client) CheckForClientMetadata(conn *websocket.Conn) (ClientInRoom, bool) {
+	/*
+		looks at the localhost data send by the client and checks if the player data it contains
+		exists as an active player connection
+	*/
+	if player, ok := client.FindClientInList(); ok {
+		player.Conn = conn
+		return player, true
+	}
+	return ClientInRoom{}, false
+}
+
+func (client *Client) FindClientInList() (ClientInRoom, bool) {
+	/*
+		checks if a client is in the list of active players
+	*/
+	for _, player := range ActivePlayerArray {
+		if player.PlayerId == client.PlayerId {
+			return player, true
+		}
+	}
+	return ClientInRoom{}, false
+}
+
+func (client *Client) DisconnectClientFromTheirRoom() {
+	/*
+		takes a client and removes them from the room in which they are apart of
+	*/
+	if clientInRoom, ok := client.FindClientInList(); ok {
+		if _, room, ok := FindRoomFromId(clientInRoom.RoomId); ok {
+			for i, p := range room.Players {
+				if p.PlayerId == clientInRoom.PlayerId {
+					room.Players = removePlayer(room.Players, i)
+					room.RoomSize -= 1
+					room.UpdateRoomForAllPlayers()
+					break
+				}
+			}
+		}
+	}
+}
+
+type ClientSender struct {
 	Type    string `json:"type"`
 	Payload Client `json:"payload"`
 }
 
-type ClientInRoom struct {
+type ClientInRoom struct { //struct to store a client and their associeted connection and room id
 	Client
 	Conn   *websocket.Conn `json:"-"`
 	RoomId int             `json:"room-id"`
 }
 
-var ActivePlayerArray = []ClientInRoom{}
-
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	CheckOrigin:     func(r *http.Request) bool { return true },
-}
-
-func EstablishWS(w http.ResponseWriter, r *http.Request) {
-	ws, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-	for {
-		_, message, err := ws.ReadMessage()
-		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("error: %v", err)
-			}
-			break
+func (client *ClientInRoom) RemoveClientFromClientArray() {
+	for i, p := range ActivePlayerArray {
+		if p.PlayerId == client.PlayerId {
+			ActivePlayerArray = remove(ActivePlayerArray, i)
 		}
-		messageAsString := string(message)
-
-		j := objx.MustFromJSON(messageAsString)
-		payload := j.Exclude([]string{"type"})
-		temp, err := payload.JSON()
-		if err != nil {
-			log.Printf("error: %v", err)
-		}
-		t := j.Get("type").Str()
-		log.Println("message: " + t)
-
-		switch t {
-		case "player-metadata":
-			var client = Client{}
-			if json.Unmarshal([]byte(temp[11:len(temp)-1]), &client); err != nil {
-				log.Printf("error: %v", err)
-			}
-			log.Println(client)
-			if player, ok := CheckForPlayerMetadata(ws, client); ok {
-				JoinRoom(ws, player)
-			}
-		case "join-room":
-			var client = ClientInRoom{}
-			if json.Unmarshal([]byte(temp[11:len(temp)-1]), &client); err != nil {
-				log.Printf("error: %v", err)
-			}
-			client.Conn = ws
-			log.Println(client)
-			JoinRoom(ws, client)
-		case "create-room":
-			var buyIn = CreateRoomPayload{}
-			if json.Unmarshal([]byte(temp[11:len(temp)-1]), &buyIn); err != nil {
-				log.Printf("error: %v", err)
-			}
-			log.Println(buyIn)
-			room := NewRoom(buyIn.BuyIn)
-			RoomArray = append(RoomArray, room)
-			ws.WriteJSON(SendRoomNumber{
-				Type: "send-room-number",
-				Payload: RoomNumber{
-					RoomNo: room.RoomId,
-				},
-			})
-		case "disconnect":
-			var client = Client{}
-			if json.Unmarshal([]byte(temp[11:len(temp)-1]), &client); err != nil {
-				log.Printf("error: %v", err)
-			}
-			log.Println(client)
-			if player, ok := FindPlayerInList(client); ok {
-				if room, ok := FindRoomFromId(player.RoomId); ok {
-					for i, p := range room.Players {
-						if p.PlayerId == player.PlayerId {
-							room.Players = removePlayer(room.Players, i)
-							room.RoomSize -= 1
-							UpdateRoomForAllPlayer(*room)
-							break
-						}
-					}
-				}
-			}
-		}
-
 	}
 }
 
-type SendRoomNumber struct {
-	Type    string     `json:"type"`
-	Payload RoomNumber `json:"payload"`
+func (client *ClientInRoom) AddClientToClientArray() {
+	ActivePlayerArray = append(ActivePlayerArray, *client)
 }
 
-type RoomNumber struct {
-	RoomNo int `json:"room-number"`
-}
-
-type CreateRoomPayload struct {
-	BuyIn int `json:"buy-in"`
-}
-
-func JoinRoom(conn *websocket.Conn, player ClientInRoom) {
-	for i, room := range RoomArray {
-		if room.RoomId == player.RoomId {
-			if len(room.Players) > 8 {
-				log.Printf("room is already at max capacity")
-				return
-			}
-			for j, p := range room.Players {
-				if p.PlayerId == player.PlayerId {
-					room.Players[j].Conn = conn
-					HandleUpdate(conn, player, room)
-					return
-				}
-			}
-			AddPlayerToRoom(conn, player, &room)
-			RoomArray[i] = room
-			HandleUpdate(conn, player, room)
-			// log.Println(player)
-			// log.Println(room)
+func (client *ClientInRoom) JoinRoom() {
+	/*
+		handles adding a client to a room (if they are not already in the room)
+	*/
+	if i, room, ok := FindRoomFromId(client.RoomId); ok {
+		if len(room.Players) > 8 {
+			log.Printf("warning: cannot add player - room is already at max capacity")
 			return
 		}
+		for j, p := range room.Players {
+			if p.PlayerId == client.PlayerId {
+				room.Players[j].Conn = client.Conn
+				client.HandlePlayerUpdate(room)
+				return
+			}
+		}
+		client.AddPlayerToRoom(room)
+		RoomArray[i] = *room
+		client.StoreConnection()
+		client.HandlePlayerUpdate(room)
+		return
 	}
 }
 
-func HandleUpdate(conn *websocket.Conn, player ClientInRoom, room Room) {
-	StoreConnection(conn, player)
-	UpdateRoomForAllPlayer(room)
+func (client *ClientInRoom) AddPlayerToRoom(room *Room) {
+	/*
+		handles adding a client to a room and making them a player
+	*/
+	smalledUnfilledPosition := 0
+	for {
+		z := false
+		for _, p := range room.Players {
+			if p.Position == smalledUnfilledPosition {
+				smalledUnfilledPosition += 1
+				z = true
+				break
+			}
+		}
+		if z == false {
+			break
+		}
+	}
+	room.Players = append(room.Players, client.NewPlayer(smalledUnfilledPosition, []int{0, 0}))
 }
 
-func UpdateRoomForAllPlayer(room Room) {
-	log.Println("Updating all players")
-	for _, p := range room.Players {
-		log.Println(p)
-		SendRoomState(p.Conn, RoomState{
-			Type:    "room-state",
-			Payload: room,
-		})
+func (client *ClientInRoom) NewPlayer(smalledUnfilledPosition int, cards []int) Player {
+	return Player{
+		Position: smalledUnfilledPosition,
+		Cards:    cards,
+		Client:   client.Client,
+		Conn:     client.Conn,
 	}
 }
 
-func SendRoomState(conn *websocket.Conn, room RoomState) {
-	conn.WriteJSON(room)
-}
-
-func StoreConnection(conn *websocket.Conn, player ClientInRoom) {
-	RemoveClientFromClientArray(player)
-	AddClientToClientArray(player)
-	conn.WriteJSON(ClientWrapper{
+func (client *ClientInRoom) StoreConnection() {
+	/*
+		stores player info on client side in localstorage
+	*/
+	client.RemoveClientFromClientArray()
+	client.AddClientToClientArray()
+	client.Conn.WriteJSON(ClientSender{
 		Type:    "player-metadata",
-		Payload: player.Client,
+		Payload: client.Client,
 	})
 }
+
+func (client *ClientInRoom) HandlePlayerUpdate(room *Room) {
+	/*
+		when a player updates, we send the current roomdata to all the players so everyone
+		is looking at the same room
+	*/
+	room.UpdateRoomForAllPlayers()
+}
+
+var ActivePlayerArray = []ClientInRoom{}

@@ -1,6 +1,8 @@
 package main
 
-import "github.com/gorilla/websocket"
+import (
+	"log"
+)
 
 var RoomArray = []Room{}
 
@@ -28,14 +30,7 @@ GetRoomNumerLoop:
 	}
 }
 
-type Player struct {
-	Client
-	Position int             `json:"position"`
-	Cards    []int           `json:"cards"`
-	Conn     *websocket.Conn `json:"-"`
-}
-
-type Room struct {
+type Room struct { // stores data about a room and its players
 	RoomId                 int      `json:"room-id"`
 	RoomSize               int      `json:"room-size"`
 	RoomBuyIn              int      `json:"room-buy-in"`
@@ -46,7 +41,40 @@ type Room struct {
 	Players                []Player `json:"players"`
 }
 
-type RoomState struct {
+func (room *Room) UpdateRoomForAllPlayers() {
+	/*
+		Goes through all the players and sends them the current state of the room
+	*/
+	log.Println("Updating all players")
+	for _, p := range room.Players {
+		log.Println(p)
+		p.SendRoomState(room)
+	}
+}
+
+type RoomSender struct {
 	Type    string `json:"type"`
 	Payload Room   `json:"payload"`
+}
+
+func FindRoomFromId(id int) (int, *Room, bool) {
+	for i, room := range RoomArray {
+		if room.RoomId == id {
+			return i, &room, true
+		}
+	}
+	return 0, &Room{}, false
+}
+
+type RoomNumberSender struct {
+	Type    string     `json:"type"`
+	Payload RoomNumber `json:"payload"`
+}
+
+type RoomNumber struct {
+	RoomNo int `json:"room-number"`
+}
+
+type BuyInReciever struct {
+	BuyIn int `json:"buy-in"`
 }
